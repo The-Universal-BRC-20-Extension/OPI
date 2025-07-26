@@ -1,9 +1,9 @@
 # OPI: 1
 
 **Title**: `swap` Operation for Universal BRC-20 Extension
-**Author**: LOL (lol@tx.lol)
+**Author**: LOL <lol@tx.lol>  
 **Discussions-To**: [https://t.me/theblacknode](https://t.me/theblacknode)  
-**Status**: Draft
+**Status**: Draft  
 **Type**: Standards Track
 **Created**: 2025-25-07
 
