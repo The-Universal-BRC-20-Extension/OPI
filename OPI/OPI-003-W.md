@@ -2,11 +2,11 @@
 
 **Title**: The "W" Standard for State-Bound Wrapped Assets on Bitcoin  
 
-**Authors**: Laz1m0v <wtf@wbtc.lol>, GaloisField2718 <galois@blockcryptology.locker>
+**Authors**: Laz1m0v, GaloisField2718 <galois@blockcryptology.locker>
 
 **Discussions-To**: https://github.com/The-Universal-BRC-20-Extension/OPI
 
-**Status**: Final  
+**Status**: Review  
 
 **Type**: Standards Track  
 
