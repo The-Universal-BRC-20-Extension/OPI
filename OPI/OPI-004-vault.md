@@ -62,8 +62,8 @@ The `vault deploy` transaction MUST adhere to the following structure:
 | --------- | ------------------------------------------- |
 | Input[0] | UTXO from the deployer. The address controlling this input becomes the immutable **Vault Creator Address**. |
 | Output[0] | OP_RETURN output containing the JSON payload with the `vault` operation |
-| Output[1] | **Genesis Fee Definition (Optional).** The exact amount of sats (e.g., 5000) that users must pay to the Vault Creator Address when calling `init`. If present, this value becomes the immutable fee constant for all future `init` operations. |
-| Output[2] | **Genesis Fee Definition (Optional).** The exact amount of sats (e.g., 2000) that users must pay to the Vault Creator Address when calling `exe`. If present, this value becomes the immutable fee constant for all future `exe` operations. |
+| Output[1] | **Genesis Fee Definition (Optional, requires `fee_check: true`).** The exact amount of sats (e.g., 5000) that users must pay to the Vault Creator Address when calling `init`. If `fee_check` is `true` and this output exists, this value becomes the immutable fee constant for all future `init` operations. If `fee_check` is absent or `false`, this output is ignored. |
+| Output[2] | **Genesis Fee Definition (Optional, requires `fee_check: true`).** The exact amount of sats (e.g., 2000) that users must pay to the Vault Creator Address when calling `exe`. If `fee_check` is `true` and this output exists, this value becomes the immutable fee constant for all future `exe` operations. If `fee_check` is absent or `false`, this output is ignored. |
 | Output[3+] | Change back to deployer or other optional outputs |
 
 **Vault Creator Address:** The address controlling Input[0] is resolved and stored by indexers at deployment. It has **no protocol power**—it cannot mint, burn, pause, or alter anything. Its sole function is as a universal anchor for tracking, discoverability, and receiving Genesis Fees (if defined).
@@ -111,7 +111,9 @@ Initializes the strategy logic for a specific pair. The deployer defines immutab
     "target_pool": "CRV/WTF",
     "fee": "200"
   },
-  "lock": "52560"
+  "lock": "52560",
+  "fee_check": true,
+  "min_harvest_interval": "144"
 }
 ```
 
@@ -124,6 +126,10 @@ Initializes the strategy logic for a specific pair. The deployer defines immutab
   - `fee`: Performance fee in basis points (bps, e.g., `"200"` = 2%)
 - `lock`: Default lock duration in blocks (e.g., `"52560"` ≈ 1 year at 10 min/block)
 
+**Optional Fields:**
+- `fee_check`: Boolean flag (default: `false`). If `true`, Output[1] and Output[2] are interpreted as Genesis Fees. If absent or `false`, Genesis Fees are ignored (set to 0).
+- `min_harvest_interval`: Minimum blocks between harvest operations (default: `"144"` ≈ 24 hours at 10 min/block). Prevents harvest spam and bounty exploitation.
+
 **Effect:** Creates a virtual vault identified by `LOL/WTF`. Genesis Fees (OPI-2 style): fixed fees in sats to the deployer for each future interaction (if defined in transaction outputs).
 
 **Validation Rules:**
@@ -131,6 +137,7 @@ Initializes the strategy logic for a specific pair. The deployer defines immutab
 - The vault ID MUST NOT start with `'y'` (case-insensitive) to avoid conflicts with yTokens (OPI-2)
 - The `target_pool` MUST reference an existing OPI-1 swap pool
 - The `fee` MUST be between `0` and `10000` (0% to 100%)
+- **Namespace Reservation**: The "/" character is reserved globally in Universal BRC-20. Any `op: deploy` (non-vault) containing "/" in ticker MUST be rejected as INVALID. Only `op: vault` with `deploy: "BASE/REWARD"` can use "/".
 
 #### Deposit Payload (`vault init`)
 
@@ -154,6 +161,10 @@ The "Zap-In": Users deposit raw assets to mint virtual shares.
 - `lock`: (Optional) User-specific lock duration in blocks. If provided, MUST be ≥ the vault's default lock. If omitted, uses vault default.
 
 **Effect:** Converts input to underlying liquidity (via OPI-1 swap if needed), mints vTokens based on current NAV (Net Asset Value). Lock prevents premature redemption for stability.
+
+**Global Lock Overwrite Rule:** If a user performs multiple deposits into the same vault, any new `vault init` operation MUST update the `lock_until_block` for the **entire vToken balance** of that address to the most distant expiration date (`max(old_lock_until_block, new_lock_until_block)`). This ensures O(1) state lookup and deterministic consensus across all indexers.
+
+**Virtual Shares Protection:** On the very first deposit (`total_vtoken_supply == 0`), the indexer MUST burn a fixed minimum of `VIRTUAL_SHARES_BURN = 1000` vTokens to the null address. This creates a liquidity floor that prevents First Depositor Inflation Attacks.
 
 **Validation Rules:**
 - The input asset MUST be one of the tokens in the vault pair
@@ -187,10 +198,13 @@ The "Heartbeat": Anyone can trigger the compounding.
 
 **Anti-Flash:** Based on state at block `b-1`, like OPI-2.
 
+**Harvest Cooldown Protection:** If `min_harvest_interval` is defined (or defaults to 144 blocks), any harvest attempt before this interval has passed since the last successful harvest is **INVALID** and yields no bounty. This prevents harvest spam and bounty exploitation.
+
 **Validation Rules:**
 - The vault MUST exist
 - The vault MUST have active positions (total vToken supply > 0)
 - The vault MUST have accumulated rewards to harvest (from OPI-2 Curve)
+- If `min_harvest_interval` is set, `current_block - last_harvest_block` MUST be ≥ `min_harvest_interval` (otherwise transaction is INVALID)
 
 #### Redemption Payload (`vault exe`)
 
@@ -256,13 +270,20 @@ def validate_vault_deploy(deploy_tx):
     # Resolve Vault Creator Address from Input[0]
     creator_address = resolve_address(deploy_tx.inputs[0])
     
-    # Extract Genesis Fees (optional)
+    # Extract Genesis Fees (optional, requires fee_check flag)
     genesis_fee_init = 0
     genesis_fee_exe = 0
-    if len(deploy_tx.outputs) > 1:
+    fee_check = getattr(deploy_data, 'fee_check', False)
+    if fee_check and len(deploy_tx.outputs) > 1:
         genesis_fee_init = deploy_tx.outputs[1].value
-    if len(deploy_tx.outputs) > 2:
+    if fee_check and len(deploy_tx.outputs) > 2:
         genesis_fee_exe = deploy_tx.outputs[2].value
+    
+    # Extract min_harvest_interval (optional, default 144 blocks)
+    min_harvest_interval = 144  # Default: ~24 hours
+    if hasattr(deploy_data, 'min_harvest_interval'):
+        min_harvest_interval = int(deploy_data.min_harvest_interval)
+        assert min_harvest_interval > 0
     
     # Initialize vault state
     create_vault_constitution(
@@ -273,9 +294,11 @@ def validate_vault_deploy(deploy_tx):
         creator_address=creator_address,
         genesis_fee_init_sats=genesis_fee_init,
         genesis_fee_exe_sats=genesis_fee_exe,
+        min_harvest_interval=min_harvest_interval,
         total_locked_liquidity=0,
         total_vtoken_supply=0,
-        liquidity_index=1e27  # RAY precision
+        liquidity_index=1e27,  # RAY precision
+        last_harvest_block=0
     )
 ```
 
@@ -314,9 +337,20 @@ def validate_vault_init(init_tx, vault_id):
     assert get_balance(user_address, input_asset) >= amount
     
     # Validate lock (if provided)
+    user_lock = const.default_lock
     if init_data.lock:
         user_lock = int(init_data.lock)
         assert user_lock >= const.default_lock
+    
+    # Global Lock Overwrite: Get existing lock and use max(old, new)
+    user_info = get_or_create_vault_user_info(vault_id, user_address)
+    current_block = get_current_block()
+    new_lock_until = current_block + user_lock
+    if user_info.lock_until_block > 0:
+        # Use most distant expiration date
+        user_info.lock_until_block = max(user_info.lock_until_block, new_lock_until)
+    else:
+        user_info.lock_until_block = new_lock_until
     
     # Process deposit
     process_vault_deposit(
@@ -324,7 +358,7 @@ def validate_vault_init(init_tx, vault_id):
         user_address=user_address,
         input_asset=input_asset,
         amount=amount,
-        user_lock=user_lock if init_data.lock else const.default_lock
+        user_lock=user_lock
     )
 ```
 
@@ -349,12 +383,19 @@ def validate_vault_harvest(harvest_tx, vault_id):
     rewards = get_accumulated_rewards(vault_id)
     assert rewards > 0
     
+    # Validate harvest cooldown (min_harvest_interval)
+    current_block = get_current_block()
+    if const.last_harvest_block > 0:
+        blocks_since_harvest = current_block - const.last_harvest_block
+        if blocks_since_harvest < const.min_harvest_interval:
+            raise HarvestTooSoon()  # Transaction INVALID, no bounty
+    
     # Process harvest
     caller_address = resolve_address(harvest_tx.inputs[0])
     process_vault_harvest(
         vault_id=vault_id,
         caller_address=caller_address,
-        current_block=get_current_block()
+        current_block=current_block
     )
 ```
 
@@ -485,7 +526,7 @@ OP_RETURN Payload (hex-encoded JSON):
 7b2270223a226272632d3230222c226f70223a227661756c74222c226465706c6f79223a224c4f4c2f575446222c227374726174656779223a7b227461726765745f706f6f6c223a224352562f575446222c22666565223a22323030227d2c226c6f636b223a223532353630227d
 
 Decoded:
-{"p":"brc-20","op":"vault","deploy":"LOL/WTF","strategy":{"target_pool":"CRV/WTF","fee":"200"},"lock":"52560"}
+{"p":"brc-20","op":"vault","deploy":"LOL/WTF","strategy":{"target_pool":"CRV/WTF","fee":"200"},"lock":"52560","fee_check":true,"min_harvest_interval":"144"}
 ```
 
 ### 2. Vault Init Transaction
@@ -533,8 +574,8 @@ Initial State:
 
 After Deposit (10000 WTF):
 - total_locked_liquidity = 10000
-- total_vtoken_supply = 10000
-- NAV = 10000 / 10000 = 1.0
+- total_vtoken_supply = 10000 - 1000 = 9000 (Virtual Shares burned)
+- NAV = 10000 / 9000 = 1.111...
 
 After Harvest (500 WTF added):
 - total_locked_liquidity = 10500
@@ -619,9 +660,15 @@ HARVEST_BOUNTY_BPS = 100  # 1% of harvested rewards to caller
 MIN_PERFORMANCE_FEE_BPS = 0  # 0% minimum
 MAX_PERFORMANCE_FEE_BPS = 10000  # 100% maximum
 
+# Virtual Shares Protection (First Depositor Attack Mitigation)
+VIRTUAL_SHARES_BURN = 1000  # Fixed minimum shares burned on first deposit
+
 # Lock durations (in blocks)
 MIN_LOCK_BLOCKS = 10  # Minimum lock period (anti-flash)
 DEFAULT_LOCK_BLOCKS = 52560  # ~1 year at 10 min/block
+
+# Harvest cooldown (in blocks)
+DEFAULT_MIN_HARVEST_INTERVAL = 144  # ~24 hours at 10 min/block
 
 # Vault limits
 MIN_VAULT_LIQUIDITY = 0  # No minimum (can start empty)
@@ -638,11 +685,12 @@ class VaultConstitution:
     creator_address: str  # Vault creator (for Genesis Fees)
     genesis_fee_init_sats: int  # Genesis fee for init (0 if not set)
     genesis_fee_exe_sats: int  # Genesis fee for exe (0 if not set)
+    min_harvest_interval: int  # Minimum blocks between harvests (default: 144)
     total_locked_liquidity: Decimal  # Total assets locked
     total_vtoken_supply: Decimal  # Total vTokens minted
     liquidity_index: Decimal  # RAY precision (init = 1e27)
     start_block: int  # Block when vault was deployed
-    last_harvest_block: int  # Last block where harvest occurred
+    last_harvest_block: int  # Last block where harvest occurred (0 if never)
 
 class VaultUserInfo:
     vault_id: str
@@ -718,9 +766,10 @@ User-specific locks prevent premature redemptions:
 | Attack Vector | Mitigation |
 |---------------|------------|
 | **Flash-deposit attack** | State calculations use block `b-1`, requiring capital commitment before block begins |
-| **Harvest spam** | Bounty only paid if rewards are actually harvested (prevents empty harvest spam) |
+| **Harvest spam** | `min_harvest_interval` cooldown prevents harvest spam and bounty exploitation |
 | **NAV manipulation** | NAV calculated from on-chain state (OPI-1 reserves, OPI-2 rewards) |
 | **Lock bypass** | Lock enforced at indexer level, preventing redemption before expiration |
+| **First Depositor Inflation Attack** | Virtual Shares mechanism burns 1000 shares on first deposit, creating liquidity floor |
 | **Inflation attack** | Debit-before-credit accounting ensures vToken supply ≤ locked liquidity |
 | **Oracle manipulation** | Fully on-chain—no external oracles required |
 | **Partial fill exploit** | OPI-1 swap integration handles partial fills with slippage tolerance |
@@ -826,15 +875,26 @@ def process_vault_deposit(
     liquidity_added = convert_to_liquidity(input_asset, amount, vault_id)
     
     # Calculate vTokens to mint
-    if const.total_vtoken_supply == 0:
+    is_first_deposit = (const.total_vtoken_supply == 0)
+    if is_first_deposit:
         # First deposit: 1:1 ratio
         vtokens_minted = liquidity_added
+        # Virtual Shares Protection: Burn fixed minimum to prevent First Depositor Attack
+        virtual_shares_burned = VIRTUAL_SHARES_BURN
+        # Ensure user receives at least 1 vToken net (must deposit > VIRTUAL_SHARES_BURN)
+        if vtokens_minted <= virtual_shares_burned:
+            raise InsufficientDepositForVirtualShares()
     else:
         vtokens_minted = liquidity_added / nav
     
     # Update vault state
     const.total_locked_liquidity += liquidity_added
     const.total_vtoken_supply += vtokens_minted
+    
+    # Virtual Shares: Burn on first deposit
+    if is_first_deposit:
+        const.total_vtoken_supply -= virtual_shares_burned
+        # Burn to null address (recorded in state, not credited to any user)
     
     # Update user info
     user_info = get_or_create_vault_user_info(vault_id, user_address)

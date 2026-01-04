@@ -70,8 +70,8 @@ OP_SHA256 <commitment_hash> OP_EQUALVERIFY <user_pubkey> OP_CHECKSIG
 | --------- | ------------------------------------------- |
 | **Input[0]** | SegWit input containing legacy BRC-20 `transfer` inscription |
 | **Output[0]** | `OP_RETURN` with minimal `bridge lock` payload |
-| **Output[1]** | **Genesis Fee (Optional)** - If protocol has fees defined |
-| **Output[2]** | **Vault P2TR Address** - Ordinal sent here (locked in vault) |
+| **Output[1]** | **Vault P2TR Address** - Ordinal sent here (locked in vault). **MUST** be at this position (Universal BRC-20 rule: "Intent is linked to the first non-OP_RETURN output") |
+| **Output[2+]** | **Genesis Fee (Optional)** - If protocol has fees defined, placed after Vault Address. Change outputs follow. |
 | **Witness[0]** | `<commitment_hash_bytes>` - 32 bytes raw |
 
 #### Transaction 2: Burn & Reveal (Unlock Vault)
@@ -162,15 +162,19 @@ The vault address is **deterministically derived** from publicly available data,
 - Create a TapLeaf with version `0xc0` and the script from Step 2
 - Compute the leaf hash: `leaf_hash = TapLeaf(version=0xc0, script=script).hash()`
 
-**Step 4: Include Standardized Tweak in MAST Root**
-- **CRITICAL**: Include the standardized Bridge tweak in the MAST root calculation
-- Compute: `mast_root = SHA256(leaf_hash + BRIDGE_TWEAK)`
-- This ensures the vault address is **provably linked** to the Bridge protocol
-- Without this tweak, the address would be a standard P2TR address, and the indexer would reject the migration
+**Step 4: Build Script Tree with BRIDGE_TWEAK Data Leaf**
+- **CRITICAL**: Include the standardized Bridge tweak as a data reveal branch in the script tree
+- Create data leaf containing BRIDGE_TWEAK: `data_leaf = TapLeaf(version=0xc0, script=BRIDGE_TWEAK)`
+- Compute data leaf hash: `data_leaf_hash = data_leaf.hash()`
+- Combine script leaf and data leaf using standard BIP-341 Tagged Hash:
+  - `mast_root = TaggedHash("TapBranch", script_leaf_hash, data_leaf_hash)`
+- This ensures the vault address is **provably linked** to the Bridge protocol through indexer consensus
+- **Indexer Consensus Rule**: The indexer MUST verify that the BRIDGE_TWEAK is present in the script tree structure when validating bridge operations. This is enforced at the consensus level, not by Bitcoin Script.
 
 **Step 5: Derive Taproot Output Key and Encode Address**
 - Derive NUMS Point (same as OPI-3, using seed `"Bitcoin:W-Protocol:Sovereign-Vault:2025"`)
-- Compute Taproot output key: `output_key = compute_taproot_output_key(internal_key=NUMS_POINT, script_tree_hash=mast_root)`
+- Compute TapTweak: `tap_tweak = TaggedHash("TapTweak", internal_key || script_tree_hash)` where `script_tree_hash = mast_root`
+- Compute Taproot output key: `output_key = internal_key + tap_tweak * G` (if script path) or `output_key = internal_key` (if key path, but script path is always used here)
 - Encode as Bech32m address: `address = encode_bech32m(output_key, "bc", 1)`
 
 **Result**: A deterministic P2TR address (e.g., `bc1p...`) that can be calculated by anyone with the user pubkey and commitment hash, enabling trustless verification.
@@ -209,13 +213,15 @@ The vault address is **deterministically derived** from publicly available data,
 
 4. **Universal Ticker Virginity**: Ensure Universal ticker (same name) is **virgin** (not deployed).
 
-5. **Vault Address Derivation**: Recalculate vault address from user pubkey, commitment hash, and standardized tweak `SHA256("UniversalBridge")`.
+5. **Vault Address Derivation**: Recalculate vault address from user pubkey, commitment hash, and standardized tweak `SHA256("UniversalBridge")` using BIP-341 TaggedHash("TapBranch", ...) construction.
 
-6. **Vault Address Verification**: Verify ordinal sent to correct vault address.
+6. **BRIDGE_TWEAK Consensus Validation**: **CRITICAL** - The indexer MUST verify that the BRIDGE_TWEAK is present in the script tree structure when deriving the vault address. This is enforced at the consensus level (indexer validates protocol linkage, Bitcoin Script validates spendability).
 
-7. **Inscription Ownership**: Verify via Ordinals API that inscription is at vault address.
+7. **Vault Address Verification**: Verify ordinal sent to correct vault address.
 
-8. **State Recording**: Record bridge lock. **NOTE**: Universal tokens NOT minted in Transaction 1.
+8. **Inscription Ownership**: Verify via Ordinals API that inscription is at vault address.
+
+9. **State Recording**: Record bridge lock. **NOTE**: Universal tokens NOT minted in Transaction 1.
 
 ### Bridge Burn Validation (Transaction 2)
 
@@ -264,7 +270,7 @@ Indexers SHOULD periodically validate protocol state integrity:
 
 ### Why Standardized Tweak?
 
-**Provable Protocol Link**: Tweak `SHA256("UniversalBridge")` guarantees vault addresses are **provably linked** to Bridge protocol, preventing confusion with standard P2TR addresses.
+**Provable Protocol Link**: Tweak `SHA256("UniversalBridge")` is integrated as a data reveal branch in the script tree using BIP-341 `TaggedHash("TapBranch", ...)`. The indexer enforces consensus-level validation that the BRIDGE_TWEAK is present, guaranteeing vault addresses are **provably linked** to Bridge protocol and preventing confusion with standard P2TR addresses. Bitcoin Script validates spendability, while indexer consensus validates protocol linkage.
 
 ---
 
